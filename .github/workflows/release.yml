@@ -1,0 +1,146 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'  # v1.0.0, v1.0.1 등의 태그가 푸시될 때 실행
+  workflow_dispatch:  # 수동 실행도 가능
+
+env:
+  DOTNET_VERSION: '8.0.x'
+  PROJECT_NAME: 'HelloWorld'
+  ARTIFACT_NAME: 'linux-x64'
+  RUNTIME: 'linux-x64'
+
+jobs:
+  build:
+    name: Build for Linux
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --configuration Release --no-restore
+
+      - name: Publish
+        run: dotnet publish --configuration Release --no-build --runtime ${{ env.RUNTIME }} --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o ./publish/${{ env.ARTIFACT_NAME }}
+
+      - name: Archive artifacts
+        shell: bash
+        run: |
+          cd publish/${{ env.ARTIFACT_NAME }}
+          tar -czf ../../${{ env.ARTIFACT_NAME }}.tar.gz *
+          cd ../..
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT_NAME }}.tar.gz
+          retention-days: 30
+
+  create-release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Get version from tag
+        id: get_version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Read release notes
+        id: release_notes
+        run: |
+          TAG_NAME="${{ steps.get_version.outputs.tag }}"
+          VERSION="${{ steps.get_version.outputs.version }}"
+          RELEASE_NOTES_DIR=".release-notes"
+          
+          # .release-notes 폴더 존재 확인
+          if [ ! -d "$RELEASE_NOTES_DIR" ]; then
+            echo "❌ Error: ${RELEASE_NOTES_DIR} directory not found!"
+            exit 1
+          fi
+          
+          # .release-notes 폴더에서 태그 버전과 일치하는 파일 찾기
+          RELEASE_NOTES_FILE=""
+          
+          if [ -f "${RELEASE_NOTES_DIR}/RELEASE_NOTES_${TAG_NAME}.md" ]; then
+            RELEASE_NOTES_FILE="${RELEASE_NOTES_DIR}/RELEASE_NOTES_${TAG_NAME}.md"
+          elif [ -f "${RELEASE_NOTES_DIR}/RELEASE_NOTES_${VERSION}.md" ]; then
+            RELEASE_NOTES_FILE="${RELEASE_NOTES_DIR}/RELEASE_NOTES_${VERSION}.md"
+          fi
+          
+          if [ -n "$RELEASE_NOTES_FILE" ]; then
+            echo "✅ Using release notes file: $RELEASE_NOTES_FILE"
+            
+            # 파일 크기 검증 (GitHub Release body는 최대 125,000자 제한)
+            MAX_CHARS=125000
+            FILE_SIZE=$(wc -c < "$RELEASE_NOTES_FILE")
+            FILE_CHARS=$(wc -m < "$RELEASE_NOTES_FILE")
+            
+            # 비율 계산 (백분율, 소수점 2자리)
+            PERCENTAGE=$(awk "BEGIN {printf \"%.2f\", ($FILE_CHARS / $MAX_CHARS) * 100}")
+            
+            echo "📊 File size: ${FILE_SIZE} bytes"
+            echo "📊 Character count: ${FILE_CHARS} characters (${PERCENTAGE}% of ${MAX_CHARS} max)"
+            
+            if [ "$FILE_CHARS" -gt "$MAX_CHARS" ]; then
+              echo "❌ Error: Release notes file exceeds GitHub Release body limit!"
+              echo ""
+              echo "Current size: ${FILE_CHARS} characters"
+              echo "Maximum allowed: ${MAX_CHARS} characters"
+              echo "Excess: $((FILE_CHARS - MAX_CHARS)) characters"
+              echo ""
+              echo "Please reduce the size of the release notes file."
+              exit 1
+            fi
+            
+            cp "$RELEASE_NOTES_FILE" release_body.txt
+            echo "✅ Release notes file validated and copied successfully"
+          else
+            echo "❌ Error: Release notes file not found!"
+            echo ""
+            echo "Expected one of the following files:"
+            echo "  - ${RELEASE_NOTES_DIR}/RELEASE_NOTES_${TAG_NAME}.md"
+            echo "  - ${RELEASE_NOTES_DIR}/RELEASE_NOTES_${VERSION}.md"
+            echo "  - ${RELEASE_NOTES_DIR}/RELEASE_NOTES.md"
+            echo ""
+            echo "Please create a release notes file before creating a release tag."
+            exit 1
+          fi
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.get_version.outputs.tag }}
+          name: Release ${{ steps.get_version.outputs.tag }}
+          body_path: release_body.txt
+          files: |
+            artifacts/${{ env.ARTIFACT_NAME }}/${{ env.ARTIFACT_NAME }}.tar.gz
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
